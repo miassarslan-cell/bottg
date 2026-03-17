@@ -1,13 +1,8 @@
-"""
-Telegram Bot для подсчёта упражнений по видео
-Использует MediaPipe Pose для анализа
-"""
-
 import os
 import logging
 import tempfile
-from pathlib import Path
-
+import asyncio
+from pathlib import Path  # можно оставить, если планируете расширять
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -28,13 +23,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Токен бота (установи через переменную окружения)
+# Токен бота (лучше через .env в продакшене)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 
 class ExerciseAnalyzer:
-    """Анализатор упражнений на видео"""
-
+    """Анализатор упражнений на видео с использованием MediaPipe Pose"""
     EXERCISE_TYPES = {
         "pushups": {
             "name": "Отжимания 💪",
@@ -61,7 +55,8 @@ class ExerciseAnalyzer:
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
+            model_complexity=1  # можно 0 для скорости
         )
 
     def calculate_angle(self, a, b, c) -> float:
@@ -73,17 +68,17 @@ class ExerciseAnalyzer:
 
     def get_landmark_coords(self, landmarks, name, shape):
         """Получает координаты точки тела"""
-        landmark = landmarks[self.mp_pose.PoseLandmark[name].value]
+        idx = self.mp_pose.PoseLandmark[name].value
+        landmark = landmarks[idx]
         return [landmark.x * shape[1], landmark.y * shape[0]]
 
     def analyze_video(self, video_path: str, exercise_type: str) -> dict:
-        """Анализирует видео и считает упражнения"""
+        """Анализирует видео и считает упражнения (с пропуском кадров для скорости)"""
         if exercise_type not in self.EXERCISE_TYPES:
             return {"error": "Неизвестный тип упражнения"}
 
         config = self.EXERCISE_TYPES[exercise_type]
         cap = cv2.VideoCapture(video_path)
-
         if not cap.isOpened():
             return {"error": "Не удалось открыть видео"}
 
@@ -92,9 +87,10 @@ class ExerciseAnalyzer:
         frames_processed = 0
         frames_with_pose = 0
         angles_history = []
-
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        FRAME_SKIP = 2  # обрабатываем каждый 2-й кадр → в 2 раза быстрее, точность почти не падает
 
         while True:
             ret, frame = cap.read()
@@ -102,44 +98,41 @@ class ExerciseAnalyzer:
                 break
 
             frames_processed += 1
+            if frames_processed % FRAME_SKIP != 0:
+                continue  # пропускаем для ускорения
+
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.pose.process(image_rgb)
 
             if results.pose_landmarks:
                 frames_with_pose += 1
                 landmarks = results.pose_landmarks.landmark
-
                 try:
                     points = [
                         self.get_landmark_coords(landmarks, config["landmarks"][0], frame.shape),
                         self.get_landmark_coords(landmarks, config["landmarks"][1], frame.shape),
                         self.get_landmark_coords(landmarks, config["landmarks"][2], frame.shape),
                     ]
-
                     angle = self.calculate_angle(*points)
                     angles_history.append(angle)
 
-                    # Логика подсчёта
+                    # Логика подсчёта (исправлена для стабильности)
                     if config.get("inverted"):
-                        # Для бицепса: down когда угол большой, up когда маленький
                         if angle > config["down_angle"]:
                             stage = "down"
-                        if angle < config["up_angle"] and stage == "down":
+                        elif angle < config["up_angle"] and stage == "down":
                             stage = "up"
                             count += 1
                     else:
-                        # Для отжиманий/приседаний
                         if angle > config["up_angle"]:
                             stage = "up"
-                        if angle < config["down_angle"] and stage == "up":
+                        elif angle < config["down_angle"] and stage == "up":
                             stage = "down"
                             count += 1
-
-                except (IndexError, KeyError):
+                except (IndexError, KeyError, ValueError):
                     continue
 
         cap.release()
-
         return {
             "exercise": config["name"],
             "count": count,
@@ -147,29 +140,38 @@ class ExerciseAnalyzer:
             "frames_analyzed": frames_processed,
             "pose_detected_frames": frames_with_pose,
             "detection_rate": round(frames_with_pose / max(frames_processed, 1) * 100, 1),
-            "duration_sec": round(total_frames / max(fps, 1), 1),
+            "duration_sec": round(total_frames / fps, 1),
             "avg_angle": round(np.mean(angles_history), 1) if angles_history else 0,
         }
 
 
-# Глобальный анализатор
+# Глобальный анализатор (один экземпляр на весь бот)
 analyzer = ExerciseAnalyzer()
 
-# Хранилище выбора пользователя (в продакшене использовать Redis/DB)
+# Хранилище выбора пользователя (для продакшена — Redis или БД)
 user_exercise_choice = {}
 
 
+# ====================== КАСТОМНЫЙ ФИЛЬТР ДЛЯ ВИДЕО (ИСПРАВЛЕНИЕ ОШИБКИ) ======================
+class VideoOrDocumentVideo(filters.BaseFilter):
+    """Фильтр, который ловит и обычные видео, и видео отправленные как документ"""
+    def filter(self, message):
+        if message.video:
+            return True
+        if message.document and message.document.mime_type and message.document.mime_type.startswith("video/"):
+            return True
+        return False
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
     welcome_text = """
 🏋️ **Бот-счётчик упражнений**
-
 Я могу посчитать количество упражнений на твоём видео!
 
 **Как использовать:**
-1. Отправь команду /analyze
-2. Выбери тип упражнения
-3. Отправь видео (до 20 МБ)
+1. /analyze
+2. Выбери упражнение
+3. Отправь видео (до 50 МБ)
 4. Получи результат!
 
 **Поддерживаемые упражнения:**
@@ -177,8 +179,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Приседания 🦵
 • Подъём на бицепс 💪
 
-**Советы для лучшего результата:**
-📹 Снимай сбоку, чтобы было видно всё тело
+**Советы:**
+📹 Снимай сбоку (видно всё тело)
 💡 Хорошее освещение
 🎯 Один человек в кадре
 """
@@ -186,7 +188,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор типа упражнения"""
     keyboard = [
         [InlineKeyboardButton("💪 Отжимания", callback_data="exercise_pushups")],
         [InlineKeyboardButton("🦵 Приседания", callback_data="exercise_squats")],
@@ -200,69 +201,68 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def exercise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора упражнения"""
     query = update.callback_query
     await query.answer()
-
     exercise_type = query.data.replace("exercise_", "")
     user_id = query.from_user.id
     user_exercise_choice[user_id] = exercise_type
-
     exercise_name = ExerciseAnalyzer.EXERCISE_TYPES[exercise_type]["name"]
+
     await query.edit_message_text(
         f"✅ Выбрано: **{exercise_name}**\n\n"
         f"Теперь отправь видео для анализа 📹\n\n"
-        f"_Видео должно быть до 20 МБ_",
+        f"_Максимум 50 МБ_",
         parse_mode="Markdown"
     )
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка видео"""
     user_id = update.message.from_user.id
 
-    # Проверяем, выбрано ли упражнение
     if user_id not in user_exercise_choice:
         await update.message.reply_text(
-            "⚠️ Сначала выбери тип упражнения!\n"
-            "Используй команду /analyze"
+            "⚠️ Сначала выбери тип упражнения!\nИспользуй команду /analyze"
         )
         return
 
     exercise_type = user_exercise_choice[user_id]
     exercise_name = ExerciseAnalyzer.EXERCISE_TYPES[exercise_type]["name"]
 
-    # Отправляем сообщение о начале обработки
+    # Получаем объект видео или документа
+    video_obj = update.message.video or update.message.document
+    if video_obj.file_size > 50 * 1024 * 1024:
+        await update.message.reply_text("❌ Видео слишком большое! Максимум 50 МБ.")
+        if user_id in user_exercise_choice:
+            del user_exercise_choice[user_id]
+        return
+
     processing_msg = await update.message.reply_text(
         f"⏳ Анализирую видео...\n"
         f"Упражнение: {exercise_name}\n\n"
-        f"_Это может занять некоторое время_",
+        f"_Это может занять 10–40 секунд_",
         parse_mode="Markdown"
     )
 
+    tmp_path = None
     try:
-        # Скачиваем видео
-        video = update.message.video or update.message.document
-        file = await context.bot.get_file(video.file_id)
-
+        # Скачиваем файл
+        file = await context.bot.get_file(video_obj.file_id)
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             tmp_path = tmp.name
             await file.download_to_drive(tmp_path)
 
-        # Анализируем
-        result = analyzer.analyze_video(tmp_path, exercise_type)
-
-        # Удаляем временный файл
-        os.unlink(tmp_path)
+        # Тяжёлая обработка в отдельном потоке (чтобы бот не "зависал")
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, analyzer.analyze_video, tmp_path, exercise_type
+        )
 
         if "error" in result:
             await processing_msg.edit_text(f"❌ Ошибка: {result['error']}")
             return
 
-        # Формируем ответ
         response = f"""
 ✅ **Анализ завершён!**
-
 🏋️ **Упражнение:** {result['exercise']}
 🔢 **Количество повторений:** {result['count']}
 
@@ -277,49 +277,53 @@ _Для нового анализа используй /analyze_
         await processing_msg.edit_text(response, parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Error processing video: {e}")
+        logger.error(f"Error processing video: {e}", exc_info=True)
         await processing_msg.edit_text(
-            f"❌ Произошла ошибка при обработке видео.\n"
-            f"Попробуй другое видео или формат."
+            "❌ Произошла ошибка при обработке видео.\nПопробуй другое видео или формат."
         )
+    finally:
+        # Гарантированно удаляем временный файл
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception as cleanup_err:
+                logger.warning(f"Не удалось удалить temp файл: {cleanup_err}")
 
-    # Очищаем выбор
-    del user_exercise_choice[user_id]
+    # Очищаем выбор пользователя
+    if user_id in user_exercise_choice:
+        del user_exercise_choice[user_id]
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда помощи"""
     help_text = """
 📖 **Справка по боту**
 
 **Команды:**
-/start - Приветствие и инструкция
-/analyze - Начать анализ видео
-/help - Эта справка
+/start — Приветствие
+/analyze — Начать анализ
+/help — Эта справка
 
 **Как снимать видео:**
-1. Расположи камеру сбоку от себя
-2. Убедись, что видно всё тело
-3. Делай упражнения в умеренном темпе
-4. Хорошее освещение улучшит результат
+1. Камера сбоку
+2. Видно всё тело
+3. Умеренный темп
+4. Хорошее освещение
 
 **Ограничения:**
-• Максимальный размер видео: 20 МБ
+• Максимум 50 МБ
 • Форматы: MP4, MOV, AVI
-• В кадре должен быть один человек
+• Один человек в кадре
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
 def main():
-    """Запуск бота"""
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ Установи TELEGRAM_BOT_TOKEN!")
         print("   export TELEGRAM_BOT_TOKEN='твой_токен'")
         return
 
     print("🚀 Запуск бота...")
-
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Регистрация обработчиков
@@ -327,7 +331,9 @@ def main():
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(exercise_callback, pattern="^exercise_"))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
+
+    # Исправленный фильтр для видео и документов-видео
+    app.add_handler(MessageHandler(VideoOrDocumentVideo(), handle_video))
 
     print("✅ Бот запущен! Нажми Ctrl+C для остановки.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
